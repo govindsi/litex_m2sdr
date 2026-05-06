@@ -220,6 +220,12 @@ class StatusLed(LiteXModule):
         # By default the LED follows live design signals. Manual mode swaps those
         # inputs for CSR-controlled values so the effect can be exercised from a
         # remote script without rebuilding the design.
+        #
+        # LiteX BIOS' generic `leds` command expects an `leds_out_write()` accessor
+        # to exist for a `leds.out` CSR. The M2SDR status LED is not a simple GPIO,
+        # but we provide a 1-bit `out` CSR as a compatibility shim. When set, it
+        # forces the LED into a bright "manual on" state.
+        self.out = out = CSRStorage(1, description="Compatibility LED output override (1=force on).")
         self.control = control = CSRStorage(fields=[
             CSRField("manual_enable", size=1, offset=0,  description="Override LED inputs from software instead of the design."),
             CSRField("time_running",  size=1, offset=1,  description="Drive the time_running input when manual mode is enabled."),
@@ -263,18 +269,20 @@ class StatusLed(LiteXModule):
         tx_activity_sel  = Signal()
         rx_activity_sel  = Signal()
         pps_pulse_sel    = Signal()
+        force_on         = Signal()
 
         self.comb += [
-            time_running_sel.eq(Mux(control.fields.manual_enable, control.fields.time_running, time_running)),
-            time_valid_sel.eq(  Mux(control.fields.manual_enable, control.fields.time_valid,   time_valid)),
-            pcie_present_sel.eq(Mux(control.fields.manual_enable, control.fields.pcie_present, pcie_present)),
-            pcie_link_up_raw.eq(Mux(control.fields.manual_enable, control.fields.pcie_link_up, pcie_link_up)),
-            dma_synced_sel.eq(  Mux(control.fields.manual_enable, control.fields.dma_synced,   dma_synced)),
-            eth_present_sel.eq( Mux(control.fields.manual_enable, control.fields.eth_present,  eth_present)),
-            eth_link_up_raw.eq( Mux(control.fields.manual_enable, control.fields.eth_link_up,  eth_link_up)),
-            tx_activity_sel.eq( Mux(control.fields.manual_enable, control.fields.tx_activity | pulse.fields.tx_activity, tx_activity)),
-            rx_activity_sel.eq( Mux(control.fields.manual_enable, control.fields.rx_activity | pulse.fields.rx_activity, rx_activity)),
-            pps_pulse_sel.eq(   Mux(control.fields.manual_enable, control.fields.pps_level   | pulse.fields.pps,         pps_pulse)),
+            force_on.eq(out.storage != 0),
+            time_running_sel.eq(Mux(control.fields.manual_enable | force_on, control.fields.time_running | force_on, time_running)),
+            time_valid_sel.eq(  Mux(control.fields.manual_enable | force_on, control.fields.time_valid   | force_on, time_valid)),
+            pcie_present_sel.eq(Mux(control.fields.manual_enable | force_on, control.fields.pcie_present | force_on, pcie_present)),
+            pcie_link_up_raw.eq(Mux(control.fields.manual_enable | force_on, control.fields.pcie_link_up | force_on, pcie_link_up)),
+            dma_synced_sel.eq(  Mux(control.fields.manual_enable | force_on, control.fields.dma_synced   | force_on, dma_synced)),
+            eth_present_sel.eq( Mux(control.fields.manual_enable | force_on, control.fields.eth_present  | force_on, eth_present)),
+            eth_link_up_raw.eq( Mux(control.fields.manual_enable | force_on, control.fields.eth_link_up  | force_on, eth_link_up)),
+            tx_activity_sel.eq( Mux(control.fields.manual_enable | force_on, (control.fields.tx_activity | pulse.fields.tx_activity) | force_on, tx_activity)),
+            rx_activity_sel.eq( Mux(control.fields.manual_enable | force_on, (control.fields.rx_activity | pulse.fields.rx_activity) | force_on, rx_activity)),
+            pps_pulse_sel.eq(   Mux(control.fields.manual_enable | force_on, (control.fields.pps_level   | pulse.fields.pps)         | force_on, pps_pulse)),
         ]
 
         # Synchronizers.

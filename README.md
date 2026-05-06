@@ -438,6 +438,10 @@ For those who want to explore the full potential of the LiteX-M2SDR board, inclu
    lspci
    ```
 
+### Optional: build with an embedded CPU + LiteX BIOS console
+
+See `SOC_TEST.md` for CPU/BIOS build options and console connection methods.
+
 3. **White Rabbit (Baseboard):**
    - White Rabbit is supported on the baseboard variant only:
    ```

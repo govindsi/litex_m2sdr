@@ -231,8 +231,15 @@ class BaseSoC(SoCMini):
         wr_nic_dir             = None,
         wr_ext_clk10_port      = None,  wr_ext_clk10_period=100.0, wr_ext_clk10_name="wr_ext_clk10",
         with_jtagbone          = True,
+        jtagbone_chain         = 1,
         with_gpio              = False,
         with_rfic_oversampling = False,
+        with_cpu               = False,
+        cpu_type               = "vexriscv",
+        cpu_variant            = "standard",
+        integrated_rom_size    = 0x10000,
+        integrated_sram_size   = 0x4000,
+        cpu_uart               = "crossover",
     ):
         # Platform ---------------------------------------------------------------------------------
 
@@ -257,13 +264,46 @@ class BaseSoC(SoCMini):
         if with_eth_ptp and with_white_rabbit:
             raise ValueError("Ethernet PTP and White Rabbit cannot both own the board time generator in the same build yet.")
 
-        # SoCMini ----------------------------------------------------------------------------------
+        if with_cpu and with_gpio and cpu_uart == "gpios":
+            raise ValueError("--with-gpio cannot be combined with --cpu-uart=gpios (both use TP1/TP2 pins).")
 
-        SoCMini.__init__(self, platform, sys_clk_freq,
+        # SoCMini / Optional CPU -------------------------------------------------------------------
+
+        soc_kwargs = dict(
             ident             = f"LiteX-M2SDR SoC / {variant} variant / built on",
             ident_version     = True,
             csr_address_width = 15,
         )
+
+        if with_cpu:
+            if cpu_uart not in ["crossover", "gpios"]:
+                raise ValueError(f"Unsupported --cpu-uart {cpu_uart}.")
+
+            # Optional: physical UART on TP1/TP2 (gpios) pins.
+            # TX = TP1 (E22), RX = TP2 (D22). 3.3V levels.
+            if cpu_uart == "gpios":
+                platform.add_extension([
+                    ("serial", 0,
+                        Subsignal("tx", Pins("E22")),
+                        Subsignal("rx", Pins("D22")),
+                        IOStandard("LVCMOS33"),
+                    )
+                ])
+
+            # Provide a minimal LiteX SoC CPU + BIOS console without requiring external UART pins.
+            # Use the CSR-based "crossover" UART so the console can be accessed through LiteX's
+            # remote bridge(s) (PCIeBone/JTAGBone/Etherbone depending on your setup).
+            soc_kwargs.update(
+                cpu_type             = cpu_type,
+                cpu_variant          = cpu_variant,
+                integrated_rom_size  = integrated_rom_size,
+                integrated_sram_size = integrated_sram_size,
+                with_uart            = True,
+                uart_name            = "serial" if (cpu_uart == "gpios") else "crossover",
+                with_timer           = True,
+            )
+
+        SoCMini.__init__(self, platform, sys_clk_freq, **soc_kwargs)
 
         # Clocking ---------------------------------------------------------------------------------
 
@@ -374,7 +414,7 @@ class BaseSoC(SoCMini):
         # JTAGBone ---------------------------------------------------------------------------------
 
         if with_jtagbone:
-            self.add_jtagbone()
+            self.add_jtagbone(chain=jtagbone_chain)
 
         # ICAP -------------------------------------------------------------------------------------
 
@@ -1146,9 +1186,21 @@ def main():
     parser.add_argument("--rescan",           action="store_true",       help="Execute PCIe Rescan while Loading/Flashing.")
     parser.add_argument("--driver",           action="store_true",       help="Generate PCIe driver from LitePCIe (override local version).")
     parser.add_argument("--without-jtagbone", action="store_true",       help="Disable JTAGBone support.")
+    parser.add_argument("--jtagbone-chain",   default=1, type=int,       help="JTAGBone USER chain (1-4).", choices=[1, 2, 3, 4])
 
     # RFIC parameters.
     parser.add_argument("--with-rfic-oversampling", action="store_true", help="Double the RFIC clock to enable the oversampling mode.")
+
+    # Optional embedded CPU / BIOS console.
+    parser.add_argument("--with-cpu",            action="store_true", help="Enable a LiteX soft-CPU and build BIOS.")
+    parser.add_argument("--cpu-type",            default="vexriscv",  help="LiteX CPU type when --with-cpu is set.")
+    parser.add_argument("--cpu-variant",         default="standard",  help="LiteX CPU variant when --with-cpu is set.")
+    parser.add_argument("--cpu-uart",            default="crossover", choices=["crossover", "gpios"],
+                        help="CPU BIOS console UART: crossover (needs litex_server) or gpios (physical UART on TP1/TP2).")
+    parser.add_argument("--integrated-rom-size", default=0x10000, type=lambda x: int(x, 0),
+                        help="Integrated ROM size in bytes (supports 0x...); BIOS is placed here when --with-cpu is set.")
+    parser.add_argument("--integrated-sram-size", default=0x4000, type=lambda x: int(x, 0),
+                        help="Integrated SRAM size in bytes (supports 0x...); used by BIOS/runtime when --with-cpu is set.")
 
     # PCIe parameters.
     parser.add_argument("--with-pcie",       action="store_true", help="Enable PCIe Communication.")
@@ -1229,6 +1281,14 @@ def main():
         # RFIC.
         with_rfic_oversampling = args.with_rfic_oversampling,
 
+        # Optional CPU.
+        with_cpu            = args.with_cpu,
+        cpu_type            = args.cpu_type,
+        cpu_variant         = args.cpu_variant,
+        integrated_rom_size = args.integrated_rom_size,
+        integrated_sram_size= args.integrated_sram_size,
+        cpu_uart            = args.cpu_uart,
+
         # PCIe.
         with_pcie     = args.with_pcie,
         with_pcie_ptm = args.with_pcie_ptm,
@@ -1256,6 +1316,7 @@ def main():
         # GPIOs.
         with_gpio     = args.with_gpio,
         with_jtagbone = not args.without_jtagbone,
+        jtagbone_chain= args.jtagbone_chain,
 
         # White Rabbit.
         with_white_rabbit = args.with_white_rabbit,
@@ -1305,8 +1366,12 @@ def main():
             r += f"_white_rabbit"
         if args.with_rfic_oversampling:
             r += "_rfic_oversampling"
+        if args.with_cpu:
+            r += f"_cpu_{args.cpu_type}"
         if args.without_jtagbone:
             r += "_no_jtagbone"
+        if args.jtagbone_chain != 1:
+            r += f"_jtagbone_chain{args.jtagbone_chain}"
         return r
 
     builder = Builder(soc, output_dir=os.path.join("build", get_build_name()), csr_csv="scripts/csr.csv")
