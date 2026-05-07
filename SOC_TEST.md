@@ -2,29 +2,260 @@
 
 This repository has optional build support for running the LiteX BIOS on an embedded soft-CPU and getting a console, without changing the default “minimal streaming/control SoC” behavior.
 
-- **CPU/BIOS enablement**: `./litex_m2sdr.py` gained `--with-cpu` and related CPU sizing/selection flags (`--cpu-type`, `--cpu-variant`, `--integrated-rom-size`, `--integrated-sram-size`).
-- **Console UART selection**: `--cpu-uart` selects where the BIOS console goes:
-  - **`crossover`**: CSR-based UART that is accessed from the host through a LiteX host bridge (`litex_server` over PCIe/JTAG/UDP/UARTBone).
-  - **`gpios`**: physical UART mapped to TP pads (TP1/TP2) so you can use a normal USB‑UART dongle without any host bridge.
+- **CPU/BIOS enablement**: use `--with-cpu` (see `--cpu-type`, `--cpu-variant`, `--integrated-rom-size`, `--integrated-sram-size`, `--no-integrated-rom-auto-size`).
+- **Console transport**: BIOS console uses LiteX’s **CSR-based crossover UART**, accessed through a host bridge (`litex_server` over PCIe, **Etherbone/UDP** (needs Ethernet in the gateware), etc.).
 - **CSR description file**: tools that talk to CSRs (e.g. `litex_term crossover`, `RemoteClient`) must use a `csr.csv` that matches the loaded bitstream. In this repo it is generated as **`scripts/csr.csv`**.
-- **JTAGBone caveat**: if the JTAG-based host bridge is unstable, CSR reads will time out (e.g. `ctrl_scratch` readback returns `0x0`) and the crossover BIOS console will appear “blank”. In that case, prefer PCIeBone (when PCIe is connected/enumerated) or the physical UART option (`--cpu-uart=gpios`).
+- **JTAGBone caveat**: when `--with-cpu` is enabled, JTAGBone is disabled automatically (soft-CPU debug and JTAGBone share JTAG). Prefer **Etherbone/UDP** or **PCIe** for the remote link.
+
+### Prerequisites + clone + first build (gateware)
+
+This section is a practical “get to a first bitstream” checklist. Exact package names can vary by distro.
+
+#### Host prerequisites (Ubuntu/Debian)
+
+```bash
+sudo apt update
+sudo apt install -y \
+  git make gcc g++ \
+  python3 python3-venv python3-pip \
+  libusb-1.0-0-dev
+```
+
+Optional but commonly used for bringup:
+
+```bash
+sudo apt install -y openocd
+```
+
+Optional but recommended for flashing/loading over FTDI/JTAG:
+
+```bash
+sudo apt install -y openfpgaloader
+```
+
+#### Clone
+
+Recommended: use LiteX’s meta-installer to fetch/install the full LiteX ecosystem into one venv, then clone `litex_m2sdr` alongside it.
+
+```bash
+git clone https://github.com/enjoy-digital/litex
+cd litex
+```
+
+If your checkout uses git submodules (some LiteX setups do), initialize them:
+
+```bash
+git submodule update --init --recursive
+```
+
+#### Python environment
+
+Create and activate a venv:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip setuptools wheel
+```
+
+Fetch and install the LiteX ecosystem into this venv:
+
+```bash
+python3 litex_setup.py init
+python3 litex_setup.py install
+```
+
+Then clone and install `litex_m2sdr` (still using the same venv):
+
+```bash
+cd ..
+git clone https://github.com/enjoy-digital/litex_m2sdr.git
+cd litex_m2sdr
+pip install -e .
+```
+
+#### FPGA toolchain (Vivado)
+
+Building the bitstream requires **Xilinx Vivado**. In each shell where you build, source Vivado’s environment first:
+
+```bash
+source /path/to/Xilinx/Vivado/<version>/settings64.sh
+```
+
+#### Optional: RISC-V toolchain (only for `--with-cpu`)
+
+If you build with `--with-cpu`, LiteX needs a RISC‑V bare‑metal GCC (e.g. `riscv64-unknown-elf-gcc`) to build the BIOS/software. Install it using your preferred method (distro package, LiteX toolchain helper, or prebuilt toolchain). If you see errors like “unable to find any of the cross compilation toolchains”, this is what’s missing.
+
+#### First build commands
+
+Minimal PCIe build (no CPU):
+
+```bash
+./litex_m2sdr.py --with-pcie --variant=baseboard --build
+```
+
+CPU + BIOS build:
+
+```bash
+./litex_m2sdr.py --with-pcie --variant=baseboard --with-cpu --build
+```
+
+CPU + BIOS + Etherbone/UDP build (for the UDP console flow below):
+
+```bash
+./litex_m2sdr.py --with-pcie --with-eth --variant=baseboard --with-cpu --build
+```
+
+### Architecture overview (host bridge + IPs in this codebase)
+
+The schematic below mirrors the usual LiteX picture (exact bus topology simplifies crossbars and DRAM when `--with-cpu` is off): **host tools** talk to **`litex_server`** transport backends, which reach **FPGA-side bridges**; those bridges sit on the same **SoC interconnect** as **CSRs and memory-mapped IPs**. A separate **streaming dataplane** carries RF samples between **LitePCIe DMA / Ethernet UDP / SATA** (when enabled) and the **AD9361** via the **crossbar**, **TX/RX header**, and **loopback** logic defined in `litex_m2sdr.py`.
+
+```mermaid
+flowchart TB
+  subgraph HOST["Host PC"]
+    direction TB
+    PY["Scripts & apps:<br/>RemoteClient, litex_term,<br/>LitePCIe user tools"]
+    SRV["litex_server"]
+    CP["CommPCIe"]
+    CU["CommUDP Etherbone"]
+    CJ["CommJTAG JTAGBone"]
+    PY --> SRV
+    SRV --> CP
+    SRV --> CU
+    SRV --> CJ
+  end
+
+  subgraph FPGA["FPGA: BaseSoC in litex_m2sdr.py"]
+    direction TB
+    subgraph BR["Host-facing bridges"]
+      BP["LitePCIe PHY, endpoint, BAR, MSI, DMA0"]
+      BE["LiteEth SFP PHY, Etherbone, UDP IQ path"]
+      BJ["JTAGBone WB master<br/>see table for when disabled"]
+    end
+
+    WB["SoC interconnect: Wishbone slaves, DRAM, CSRs"]
+
+    subgraph MAP["Always-on M2SDR core blocks"]
+      M1["SoC: ctrl, uart, identifier, timers, spi flash helpers"]
+      M2["capability"]
+      M3["SI5351 clock gen + sequencer"]
+      M4["time_gen, PPS, MultiClkMeasurement"]
+      M5["AD9361 RFIC + SPI + PRBS / AGC"]
+      M6["TXRX_Header, Loopback, stream Crossbar"]
+      M7["StatusLed + BIOS leds.out hook"]
+      MUTIL["ICAP, XADC, DNA"]
+    end
+
+    subgraph OPT["Optional blocks CLI gated"]
+      O1["VexRiscv, ROM, SRAM, BIOS, crossover UART"]
+      O2["SATA stack + PCIe MSIs"]
+      O3["LiteEth PTP discipline"]
+      O4["VRT over UDP"]
+      O5["GPIO via TP pads"]
+      O6["White Rabbit subsystem"]
+      O7["LitePCIe Wishbone SATA shim"]
+      O8["LiteScope probes"]
+      O9["PCIe PTM"]
+    end
+
+    DP["Streaming IQ path<br/>crossbar hooked to PCIe DMA / Eth / SATA slots"]
+  end
+
+  CP <-->|PCIe| BP
+  CU <-->|SFP link| BE
+  CJ <-->|JTAG| BJ
+
+  BP --> WB
+  BE --> WB
+  BJ --> WB
+
+  WB --> MAP
+  WB --> OPT
+
+  BP -.->|LiteDMA| DP
+  BE -.->|UDP IQ| DP
+  O2 -.->|optional SATA| DP
+  M6 -.->|header loopback rfic| DP
+```
+
+**How to read the optional column**
+
+| Approximate gateware block | Typical CLI gate |
+|---|---|
+| Host bridge PCIe + DMA | `--with-pcie` |
+| Etherbone + SFP datapath over UDP | `--with-eth` (baseboard variant) |
+| JTAGBone | default; `--without-jtagbone` to drop; suppressed when `--with-cpu` |
+| Soft CPU + BIOS crossover console | `--with-cpu` |
+| SATA | `--with-sata` |
+| Ether PTP extras | `--with-eth --with-eth-ptp` |
+| VRT egress | `--with-eth-vrt` |
+| Expansion GPIO | `--with-gpio` |
+| White Rabbit | `--with-white-rabbit` (+ WR firmware paths) |
+| LiteScope ILA | `--with-*-probe` family in `litex_m2sdr.py` |
+| PCIe PTM timing | `--with-pcie-ptm` |
+
+### Memory map (ROM / SRAM / CSR) and `csr.csv` reference
+
+The authoritative memory map for a *specific bitstream build* is the generated **`scripts/csr.csv`** file.
+If you rebuild the SoC with different options, **always use the new matching `scripts/csr.csv`**.
+
+#### Top-level regions
+
+Look for `memory_region` lines near the bottom of `scripts/csr.csv`, for example:
+
+```text
+memory_region,rom,0x00000000,32768,cached
+memory_region,sram,0x10000000,65536,cached
+memory_region,csr,0xf0000000,131072,io
+```
+
+- **`rom`**: CPU reset/BIOS lives here when `--with-cpu` is enabled (size depends on `--integrated-rom-size` and ROM auto-sizing).
+- **`sram`**: integrated SRAM for BIOS/runtime when `--with-cpu` is enabled (size depends on `--integrated-sram-size`).
+- **`csr`**: CSR/MMIO window. This is where `RemoteClient` and `litex_term crossover` read/write peripheral registers via the host bridge.
+
+#### CSR peripheral base addresses
+
+At the top of `scripts/csr.csv`, `csr_base` lines give each peripheral’s base address inside the CSR window, e.g.:
+
+```text
+csr_base,ctrl,0xf0000000,,
+csr_base,uart,0xf0000800,,
+csr_base,leds,0xf0003800,,
+```
+
+Then `csr_register` lines enumerate individual registers and their absolute addresses:
+
+```text
+csr_register,ctrl_scratch,0xf0000004,1,rw
+csr_register,uart_rxempty,0xf0000808,1,ro
+csr_register,leds_out,0xf0003800,1,rw
+```
+
+Tip: `csr_base` tells you “where the block starts”; `csr_register` tells you “the exact address to poke”.
+
+### BIOS `leds` command and gateware (`leds.out`)
+
+LiteX BIOS can drive a CSR named **`leds.out`** (`leds_out_write()` in generated software). On M2SDR, the RGB status LED is **not** three separate BIOS GPIOs: the `StatusLed` core implements patterns (breathing, heartbeat, activity, etc.). A **1-bit `out`** CSR is provided so the BIOS **`leds`** command still has a compatible hook: when `leds.out` is non‑zero, the LED is **forced on** atop the animator. That does **not** change hue or scripted blink patterns from the BIOS alone—those come from the gateware animator plus this override.
 
 ### Optional: build with an embedded CPU + LiteX BIOS console
 
 By default, the LiteX-M2SDR SoC is built as a minimal control/streaming design (no embedded CPU).
-If you want a **soft-CPU + BIOS** for quick experiments or a small bare-metal app, you can enable it with:
+If you want a **soft-CPU + BIOS** for quick experiments or a small bare-metal app, enable it with `--with-cpu`.
+
+**PCIe-only build** (no on-board Etherbone unless you also enable Ethernet):
 
 ```bash
 ./litex_m2sdr.py --with-pcie --variant=baseboard --with-cpu --build --load
 ```
 
-- The build enables a **VexRiscv** CPU by default (`--cpu-type vexriscv`) with an integrated ROM/SRAM and the LiteX BIOS.
-- By default, the console uses LiteX's **crossover UART** (CSR-based), so it does not require dedicated UART pins (but it needs a working LiteX remote link).
-- If you want a **physical UART** console (no PCIe/etherbone/JTAGBone needed), use `--cpu-uart=gpios` and connect a 3.3V USB-UART:
-  - TX = TP1 (`E22`)
-  - RX = TP2 (`D22`)
-  - Baudrate = `115200`
-- You can tune sizes with `--integrated-rom-size` / `--integrated-sram-size` (hex values accepted, e.g. `0x20000`).
+**CPU + PCIe + Ethernet** (needed for **`litex_server --udp`** / Etherbone in this design):
+
+```bash
+./litex_m2sdr.py --with-pcie --with-eth --variant=baseboard --with-cpu --build --load
+```
+
+- Default CPU is **`--cpu-type vexriscv`** with integrated ROM/SRAM sizes set in the build script (`--integrated-rom-size` / `--integrated-sram-size`, hex allowed, e.g. `0x20000`).
+- The console uses LiteX’s **crossover UART** (CSR-based); you still need a working `litex_server` link to the board.
 
 ### Build / load / flash (gateware)
 
@@ -36,15 +267,15 @@ All commands below are run from the `litex_m2sdr/` directory.
 ./litex_m2sdr.py --with-pcie --variant=baseboard --with-cpu --build
 ```
 
-#### Load to FPGA SRAM (volatile)
+Add `--with-eth` if you plan to use the **Etherbone/UDP** flow below.
 
-If you already built:
+#### Load to FPGA SRAM (volatile)
 
 ```bash
 ./litex_m2sdr.py --with-pcie --variant=baseboard --with-cpu --load
 ```
 
-Or build + load in one step:
+Or build + load:
 
 ```bash
 ./litex_m2sdr.py --with-pcie --variant=baseboard --with-cpu --build --load
@@ -56,59 +287,62 @@ Or build + load in one step:
 ./litex_m2sdr.py --with-pcie --variant=baseboard --with-cpu --build --flash
 ```
 
+You can also program with **openFPGALoader** (or another tool) using the `.bit` under `build/<build_name>/gateware/`, matching your cable and FPGA part.
+
 ### Connect to the BIOS console
 
 #### Crossover UART (needs a working LiteX remote link)
 
-Use `litex_term` with the remote transport you are using (PCIeBone/JTAGBone/Etherbone).
-See the LiteX tools documentation for the exact `litex_term` invocation for your chosen transport.
+Use `litex_term` while `litex_server` is running for your transport (PCIeBone, Etherbone/UDP, etc.).
 
 Notes:
-- `litex_term crossover` does **not** open `/dev/ttyUSB*`. It reads/writes the SoC’s `uart_xover_*` CSRs through `litex_server`.
-- If you change your SoC configuration and rebuild, regenerate and use the matching `scripts/csr.csv`.
 
-##### Test the crossover UART via JTAGBone
+- `litex_term crossover` does **not** open `/dev/ttyUSB*`. It talks to CSR UART registers through `litex_server`.
+- This SoC’s crossover block is typically exposed as **`uart_*`** CSRs (not `uart_xover_*`). If the terminal stays blank, use:
 
-1. Start the server (leave it running):
+  ```bash
+  litex_term crossover --csr-csv scripts/csr.csv --crossover-name uart
+  ```
 
-```bash
-litex_server --jtag --jtag-config=<path-to-openocd-cfg> --jtag-chain <n>
-```
+  If your `csr.csv` uses the `uart_xover` prefix, omit `--crossover-name` or set it to match the CSV.
+- After changing the SoC and rebuilding, copy/use the new **`scripts/csr.csv`** from that build.
+- If the shell looks “stuck” or you only see repeated control characters, avoid hammering **Ctrl-C** in the terminal, toggle **system reset** once if your design exposes it, and restart `litex_term`.
 
-Where:
-- `<path-to-openocd-cfg>` is your OpenOCD config for the JTAG adapter you are using.
-- `<n>` must match the bitstream’s JTAGBone USER chain (default is `1`; if you built with a custom chain, use the same value).
+##### Etherbone/UDP (recommended when `--with-cpu` and JTAGBone is off)
 
-2. Verify CSR read/write works (in another terminal):
+1. Build with **`--with-eth`** so Etherbone is in the bitstream.
+2. Put the host PC on the **same subnet** as the FPGA’s configured IP (default **`--eth-local-ip 192.168.1.50`**, e.g. set the PC to `192.168.1.10/24`). Confirm with `ping 192.168.1.50`.
+3. Start the server (leave it running):
 
-```bash
-python3 - <<'PY'
-from litex import RemoteClient
-b = RemoteClient(csr_csv="scripts/csr.csv", debug=True)
-b.open()
-b.regs.ctrl_scratch.write(0x12345678)
-print("scratch:", hex(b.regs.ctrl_scratch.read()))
-b.close()
-PY
-```
+   ```bash
+   litex_server --udp --udp-ip 192.168.1.50
+   ```
 
-Expected: `scratch: 0x12345678`. If you get timeouts / `0x0`, the JTAGBone CSR tunnel is not working and the crossover console will not work either.
+   Example (expected output):
 
-3. Open the BIOS console:
+   ![litex_server over UDP connected](docs/images/litex-server-udp.png)
 
-```bash
-litex_term crossover --csr-csv scripts/csr.csv
-```
+4. Verify CSR access (second terminal):
 
-#### Physical UART on TP1/TP2 (no host bridge required)
+   ```bash
+   python3 - <<'PY'
+   from litex import RemoteClient
+   b = RemoteClient(csr_csv="scripts/csr.csv", debug=True)
+   b.open()
+   b.regs.ctrl_scratch.write(0x12345678)
+   print("scratch:", hex(b.regs.ctrl_scratch.read()))
+   b.close()
+   PY
+   ```
 
-Connect a 3.3V USB-UART to the board:
-- TX = TP1 (`E22`)
-- RX = TP2 (`D22`)
+   Expected: `scratch: 0x12345678`. If you read `0x0` or time out, fix networking / bitstream (`--with-eth`) / `csr.csv` before debugging the UART.
 
-Then open a terminal at 115200 baud (example):
+5. Open the BIOS console:
 
-```bash
-picocom -b 115200 /dev/ttyUSB0
-```
+   ```bash
+   litex_term crossover --csr-csv scripts/csr.csv --crossover-name uart
+   ```
 
+   Example (BIOS banner + `litex>` prompt):
+
+   ![LiteX BIOS console via litex_term crossover](docs/images/bios-console-litex-term.png)
