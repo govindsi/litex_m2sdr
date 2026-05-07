@@ -239,6 +239,7 @@ class BaseSoC(SoCMini):
         cpu_variant            = "standard",
         integrated_rom_size    = 0x8000,
         integrated_sram_size   = 0x10000,
+        integrated_main_ram_size = 0x20000,
     ):
         # Platform ---------------------------------------------------------------------------------
 
@@ -279,6 +280,7 @@ class BaseSoC(SoCMini):
                 cpu_variant=cpu_variant,
                 integrated_rom_size=integrated_rom_size,
                 integrated_sram_size=integrated_sram_size,
+                integrated_main_ram_size=integrated_main_ram_size,
                 uart_name="crossover",
                 bus_interconnect="crossbar",
                 **soc_kwargs,
@@ -1186,6 +1188,8 @@ def main():
                         help="Integrated ROM size in bytes (supports 0x...).")
     parser.add_argument("--integrated-sram-size", default=0x10000, type=lambda x: int(x, 0),
                         help="Integrated SRAM size in bytes (supports 0x...).")
+    parser.add_argument("--integrated-main-ram-size", default=0x20000, type=lambda x: int(x, 0),
+                        help="Integrated main RAM size in bytes (supports 0x...). Used to run uploaded apps without corrupting BIOS SRAM.")
 
     # RFIC parameters.
     parser.add_argument("--with-rfic-oversampling", action="store_true", help="Double the RFIC clock to enable the oversampling mode.")
@@ -1275,6 +1279,7 @@ def main():
         cpu_type      = args.cpu_type,
         integrated_rom_size  = args.integrated_rom_size,
         integrated_sram_size = args.integrated_sram_size,
+        integrated_main_ram_size = args.integrated_main_ram_size,
 
         # PCIe.
         with_pcie     = args.with_pcie,

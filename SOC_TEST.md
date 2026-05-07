@@ -346,3 +346,109 @@ Notes:
    Example (BIOS banner + `litex>` prompt):
 
    ![LiteX BIOS console via litex_term crossover](docs/images/bios-console-litex-term.png)
+
+### Optional: load and run a demo application from BIOS (`m2sdr_diag`)
+
+This repo includes a small bare‑metal “diagnostics/self‑test” app that can be loaded from the BIOS “serial boot” mechanism and run on the embedded CPU:
+
+- Source: `litex_m2sdr/software/baremetal/m2sdr_diag/`
+- Output: `m2sdr_diag.bin`
+
+#### Build the app
+
+Build it against the same SoC build directory you used for the bitstream (the directory that contains `software/include/generated/variables.mak`):
+
+```bash
+cd litex_m2sdr/software/baremetal/m2sdr_diag
+make BUILD_DIR=../../../../build/<your_build_name>
+```
+
+#### Load/run via the BIOS boot protocol
+
+LiteX BIOS will try “Booting from serial…” first. If `litex_term` is connected, it can upload and boot a binary (see the LiteX wiki for details: [Load Application Code To CPU](https://github.com/enjoy-digital/litex/wiki/Load-Application-Code-To-CPU)).
+
+With this project’s Etherbone/crossover setup, run:
+
+```bash
+litex_term crossover --csr-csv scripts/csr.csv --crossover-name uart --kernel litex_m2sdr/software/baremetal/m2sdr_diag/m2sdr_diag.bin
+```
+
+Expected behavior: the BIOS receives the upload and jumps into the app, which prints a summary and PASS/FAIL status, then halts (WFI loop).
+
+#### If `litex_term --kernel` stalls over Etherbone/UDP
+
+On some setups, `litex_term --kernel` can stall when used over Etherbone + crossover UART because the PTY bridge can drop bytes without applying TX flow control. In that case use the direct CSR-UART SFL loader:
+
+```bash
+python3 scripts/litex_sfl_load.py --csr-csv scripts/csr.csv \
+  --uart-name uart_xover \
+  --file litex_m2sdr/software/baremetal/m2sdr_diag/m2sdr_diag.bin \
+  --address 0x40000000 --jump
+```
+
+Notes:
+- Use `--uart-name uart` if your design’s BIOS console is on `uart_*` CSRs instead of `uart_xover_*`.
+- The loader waits for the BIOS SFL magic string. Since Etherbone/UDP is typically single-client, you may not be able to keep a `litex_term` console open at the same time. In that case, add `--reset-cpu` so the loader reboots the BIOS itself:
+
+  ```bash
+  python3 scripts/litex_sfl_load.py --csr-csv scripts/csr.csv --reset-cpu --wait-magic-timeout 30 \
+    --uart-name uart_xover \
+    --file litex_m2sdr/software/baremetal/m2sdr_diag/m2sdr_diag.bin \
+    --address 0x40000000 --jump
+  ```
+
+#### Recommended (fast dev loop): load to SRAM over RemoteClient, then `boot`
+
+Since Etherbone/UDP is often single-client and the BIOS SFL serialboot upload can be fragile over crossover, the most reliable iteration loop is:
+
+1) Open a `litex_term` console to the BIOS.
+2) **Close `litex_term`** (so the UDP/Etherbone connection is free).
+3) Upload your app binary into **integrated SRAM** using `RemoteClient`.
+4) Re-open `litex_term` and jump to it with `boot <address>`.
+
+If you keep `litex_term` open while running the upload script, you’ll typically see `BrokenPipeError` in `litex_term` threads. That’s expected: both tools are fighting for the same single-client connection.
+
+Example with the built-in `m2sdr_diag` app:
+
+1. In a terminal (BIOS console):
+
+```bash
+litex_term crossover --csr-csv scripts/csr.csv
+```
+
+2. Exit `litex_term` (press Ctrl-C twice quickly to exit the tool).
+
+3. Upload the app into **main RAM** (recommended) and boot it from there.
+
+Why: on CPU builds, `sram` is used by the BIOS for `.data/.bss/stack`. Writing your binary into `sram` can corrupt the running BIOS and require a power-cycle to recover.
+
+With `--integrated-main-ram-size` enabled (default in this repo), LiteX exposes a separate `main_ram` region (typically at `0x40000000`) that is safe for app uploads.
+
+Upload:
+
+```bash
+# IMPORTANT: rebuild `m2sdr_diag` against the SAME build dir as the loaded bitstream.
+# It must have `main_ram` declared in `software/include/generated/regions.ld`.
+cd litex_m2sdr/software/baremetal/m2sdr_diag
+make clean
+make BUILD_DIR=../../../../build/litex_m2sdr_baseboard_eth_cpu_standard
+cd -
+
+python3 scripts/load_to_sram.py --csr-csv scripts/csr.csv \
+  --file litex_m2sdr/software/baremetal/m2sdr_diag/m2sdr_diag.bin \
+  --addr 0x40000000 \
+  --chunk-words 4 --delay-ms 1
+```
+
+4. Re-open `litex_term` and jump to SRAM:
+
+```bash
+litex_server --udp --udp-ip 192.168.1.50
+litex_term crossover --csr-csv scripts/csr.csv
+```
+
+```text
+litex> boot 0x40000000
+```
+
+If `litex_term` shows `BrokenPipeError` after running the upload script, restart `litex_server` and retry: the server may have dropped the client during a transient UDP timeout.
